@@ -8,7 +8,7 @@ from secbrn.eval import Evaluator, load_goldset
 from secbrn.eval import metrics as M
 
 FIX = Path(__file__).parent / "fixtures"
-GOLD = Path(__file__).parent.parent / "eval" / "gold.json"
+GOLD = Path(__file__).parent / "fixtures" / "gold_offline.json"
 
 
 # ── metrics unit tests ──────────────────────────────────────────────────────────
@@ -66,3 +66,54 @@ def test_eval_runs_with_only_resolution_section(brain):
     report = Evaluator(brain).evaluate(gs)
     assert report.retrieval is None and report.resolution is not None
     assert report.resolution.f1 == 1.0
+
+
+# ── production gold set + A/B comparison ─────────────────────────────────────────
+PROD_GOLD = Path(__file__).parent.parent / "eval" / "gold.json"
+
+
+def _fake_isolated():
+    from secbrn.config import Settings
+    from secbrn.graph.memory import InMemoryStore
+    from secbrn.pipeline import Brain
+    from secbrn.providers.fake import FakeEmbedder, FakeLLM
+    s = Settings(provider="fake", embed_dim=64, chunk_size=500, chunk_overlap=60)
+    llm = FakeLLM()
+    return Brain(settings=s, store=InMemoryStore(), embedder=FakeEmbedder(dim=64),
+                 extract_llm=llm, answer_llm=llm)
+
+
+def test_prod_gold_labels_reference_real_docs():
+    """Every retrieval 'relevant' title must be an actual corpus document title."""
+    gs = load_goldset(PROD_GOLD)
+    brain = _fake_isolated()
+    cp = gs.corpus_path()
+    assert cp and cp.exists(), "corpus path missing"
+    brain.ingest(cp, resolve=False)
+    titles = {d.title for d in brain.store.documents.values()}
+    gold_titles = {t for case in gs.retrieval for t in case.relevant}
+    missing = gold_titles - titles
+    assert not missing, f"gold references non-existent doc titles: {missing}"
+    assert len(gs.retrieval) >= 25
+    brain.close()
+
+
+def test_ab_extract_model_override_runs():
+    """A/B plumbing: two extract-model settings copies both evaluate end-to-end."""
+    from secbrn.config import get_settings
+    from secbrn.pipeline import Brain
+
+    gs = load_goldset(PROD_GOLD)
+    base = get_settings().model_copy(update={"provider": "fake", "embed_dim": 64})
+    reports = []
+    for m in ("model-a", "model-b"):
+        s2 = base.model_copy(update={"extract_model": m})
+        assert s2.extract_model == m
+        brain = Brain.isolated(s2)
+        try:
+            brain.ingest(gs.corpus_path(), resolve=False)
+            reports.append(Evaluator(brain).evaluate(gs))
+        finally:
+            brain.close()
+    assert all(r.retrieval is not None for r in reports)
+    assert all(r.entities is not None for r in reports)

@@ -300,6 +300,61 @@ def eval_cmd(
         console.print("[dim]TP=correct merges  FP=over-merges (bad)  FN=missed duplicates[/dim]")
 
 
+@app.command("eval-compare")
+def eval_compare(
+    extract_models: str = typer.Option(..., "--extract-models", help="Comma-separated extract models to A/B, e.g. 'llama3.1:8b,qwen2.5:7b'."),
+    gold: str = typer.Option("eval/gold.json", "--gold", help="Gold-set path."),
+    k: int = typer.Option(None, "--k", help="Retrieval cutoff k."),
+):
+    """A/B several SECBRN_EXTRACT_MODELs on the same gold set and print a delta table.
+
+    Each model re-ingests the gold corpus into an isolated in-memory brain (real
+    embeddings + that extract model), so the comparison is apples-to-apples.
+    """
+    from secbrn.eval import Evaluator, load_goldset
+
+    gs = load_goldset(gold)
+    base = get_settings()
+    models = [m.strip() for m in extract_models.split(",") if m.strip()]
+    if len(models) < 2:
+        console.print("[yellow]Give at least two --extract-models to compare.[/yellow]")
+    cp = gs.corpus_path()
+    results = []
+    for m in models:
+        s2 = base.model_copy(update={"extract_model": m})
+        console.print(f"[dim]running extract_model={m} (embed={s2.embed_model})…[/dim]")
+        brain = Brain.isolated(s2)
+        try:
+            if gs.retrieval and cp is not None:
+                brain.ingest(cp)
+            rep = Evaluator(brain, k=k).evaluate(gs)
+        finally:
+            brain.close()
+        results.append((m, rep))
+
+    t = Table(title="Model A/B (extract model)")
+    for col in ("extract model", "ext.F1", "triple.F1", "res.F1", "precision@R", "MAP", "nDCG@k"):
+        t.add_column(col, justify="right")
+    base_metrics = None
+    for m, rep in results:
+        ent = rep.entities.f1 if rep.entities else 0.0
+        tri = rep.triples.f1 if rep.triples else 0.0
+        res = rep.resolution.f1 if rep.resolution else 0.0
+        rpr = rep.retrieval.r_precision if rep.retrieval else 0.0
+        mp = rep.retrieval.map if rep.retrieval else 0.0
+        nd = rep.retrieval.ndcg_at_k if rep.retrieval else 0.0
+        cur = (ent, tri, res, rpr, mp, nd)
+        if base_metrics is None:
+            base_metrics = cur
+            cells = [f"{x:.2f}" for x in cur]
+        else:
+            cells = [f"{x:.2f} ({x-b:+.2f})" for x, b in zip(cur, base_metrics)]
+        t.add_row(m, *cells)
+    console.print(t)
+    console.print("[dim]Deltas are vs the first model. ext/triple/res measure the graph; "
+                  "retrieval barely moves unless you also change the embedding model.[/dim]")
+
+
 def main():  # pragma: no cover
     app()
 

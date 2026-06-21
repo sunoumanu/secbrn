@@ -72,3 +72,29 @@ Gold-set schema lives in `secbrn/eval/dataset.py`. JSON and YAML are both accept
   title / section heading (0 disables it).
 - `SECBRN_RES_*` thresholds — resolution precision (over-merge) vs. recall (missed dup).
 - `SECBRN_EXTRACT_MODEL` — a stronger local model raises extraction F1.
+
+## A/B testing models
+
+`secbrn eval-compare` runs the same gold set against several extraction models and
+prints a delta table. Each model re-ingests the gold corpus into an isolated in-memory
+brain (real embeddings + that extract model), so it's apples-to-apples.
+
+```bash
+secbrn eval-compare --extract-models "llama3.1:8b,qwen2.5:7b,llama3.1:70b"
+```
+
+Reading the result: `ext.F1` / `triple.F1` / `res.F1` measure the **graph** the
+extraction model builds — this is where a stronger model pays off. The retrieval
+columns (`precision@R`, `MAP`, `nDCG@k`) barely move when you only change the extract
+model, because retrieval ranking is driven by the **embedding** model. To compare
+embedding models instead, change `SECBRN_EMBED_MODEL` + `SECBRN_EMBED_DIM` and re-run
+`secbrn eval` (the dim must match the model).
+
+### Workflow to actually improve scores
+
+1. `secbrn eval --gold eval/gold.json` — baseline on the rich corpus (`eval/corpus/`).
+2. `secbrn eval-compare --extract-models "<current>,<stronger>"` — see the graph-quality delta.
+3. Pick the winner, set `SECBRN_EXTRACT_MODEL`, then **re-ingest your real notes** (the
+   extraction model only affects data written at ingest time) and re-run `secbrn eval`.
+4. Repoint `corpus` in `eval/gold.json` at your own notes and add real questions so the
+   numbers reflect your actual usage.
