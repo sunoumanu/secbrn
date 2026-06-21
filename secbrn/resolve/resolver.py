@@ -23,6 +23,7 @@ from pathlib import Path
 from secbrn.config import Settings
 from secbrn.graph.base import GraphStore, StoredEntity, cosine
 from secbrn.providers.base import LLM
+from secbrn.util import map_workers
 
 _NONALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -107,6 +108,33 @@ class EntityResolver:
         blocks += [b for b in by_label.values() if len(b) > 1]
         return blocks
 
+    def _names_needing_embedding(self, blocks: list[list[StoredEntity]]) -> list[str]:
+        """Names that survive the cheap string gate in at least one pair (so their
+        embedding is consulted). Mirrors the gate in :meth:`plan`; order-stable for
+        deterministic, reproducible fetching."""
+        needed: list[str] = []
+        seen_names: set[str] = set()
+        seen_pairs: set[tuple[str, str]] = set()
+        for block in blocks:
+            for i in range(len(block)):
+                for j in range(i + 1, len(block)):
+                    a, b = block[i], block[j]
+                    if a.name == b.name:
+                        continue
+                    pair = tuple(sorted((a.name, b.name)))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    ss = string_similarity(a.name, b.name)
+                    wd = _levenshtein(normalize_name(a.name), normalize_name(b.name))
+                    if ss < self.s.res_similarity_threshold and wd > self.s.res_word_distance:
+                        continue
+                    for name in (a.name, b.name):
+                        if name not in seen_names:
+                            seen_names.add(name)
+                            needed.append(name)
+        return needed
+
     # ── planning ────────────────────────────────────────────────────────────────
     def plan(self) -> list[MergeDecision]:
         entities = self.store.all_entities()
@@ -123,14 +151,30 @@ class EntityResolver:
             decisions.append(MergeDecision(canon, dup, 1.0, None, "alias_seed"))
 
         # 2) fuzzy within blocks
+        blocks = self._blocks(entities)
+
+        # Entity-context embeddings are independent store round-trips; for the real Neo4j
+        # backend that's one query each. Pre-pass the blocks to find exactly the names that
+        # will need an embedding (those in a pair surviving the cheap string gate), then
+        # fetch them concurrently. The cache is name-keyed, so results — and therefore every
+        # merge decision — are identical to the serial version; only the latency changes.
         emb_cache: dict[str, list[float] | None] = {}
+        needed = self._names_needing_embedding(blocks)
+        if needed and self.s.resolve_concurrency > 1:
+            fetched = map_workers(
+                self.store.entity_context_embedding, needed, self.s.resolve_concurrency
+            )
+            for name, (vec, err) in zip(needed, fetched):
+                if err is not None:
+                    raise err
+                emb_cache[name] = vec
 
         def emb(name: str):
             if name not in emb_cache:
                 emb_cache[name] = self.store.entity_context_embedding(name)
             return emb_cache[name]
 
-        for block in self._blocks(entities):
+        for block in blocks:
             for i in range(len(block)):
                 for j in range(i + 1, len(block)):
                     a, b = block[i], block[j]

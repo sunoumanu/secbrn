@@ -1,0 +1,22 @@
+{
+  "questions": [
+    {
+      "query": "How does reranking relate to retrieval quality?",
+      "expected": "Reranking is a post-fusion step that uses an LLM to reorder the top candidate chunks. By judging relevance directly it raises precision@k, at the cost of one extra LLM call per query.",
+      "key_facts": [
+        "reranking reorders candidates after fusion",
+        "reranking improves precision",
+        "reranking adds an LLM call per query"
+      ]
+    },
+    {
+      "query": "What is entity resolution for and how does it work here?",
+      "expected": "Entity resolution merges duplicate entity nodes (e.g. pgvector / PGVector) into one canonical node. It blocks candidates, scores them by string and embedding similarity, optionally asks an LLM on close calls, and records reversible merges.",
+      "key_facts": [
+        "merges duplicate entities into a canonical node",
+        "uses string and embedding similarity",
+        "merges are reversible"
+      ]
+    }
+  ]
+}

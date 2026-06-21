@@ -52,6 +52,17 @@ class InMemoryStore(GraphStore):
     def close(self) -> None:
         pass
 
+    def clear(self) -> None:
+        """Drop all in-memory state; schema flag is kept so the store stays usable."""
+        self.documents.clear()
+        self.chunks.clear()
+        self.has_chunk.clear()
+        self.entities.clear()
+        self.mentions.clear()
+        self.relations.clear()
+        self.doc_links.clear()
+        self.same_as.clear()
+
     def ping(self) -> bool:
         return True
 

@@ -1,12 +1,23 @@
 """`secbrn` command-line interface — a thin wrapper over :class:`Brain`.
 
-Commands: ingest, ask, search, stats, resolve, reindex, healthcheck.
+Commands: ingest, ask, search, stats, resolve, reindex, reset, healthcheck,
+eval, eval-answers, eval-compare, eval-sweep.
 """
 
 from __future__ import annotations
 
+import sys
+
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 
 from secbrn.config import get_settings
@@ -45,6 +56,8 @@ def ingest(
     url: str = typer.Option(None, "--url", help="Ingest a web page instead of a path."),
     no_resolve: bool = typer.Option(False, "--no-resolve", help="Skip entity resolution."),
     debug: bool = typer.Option(False, "--debug", help="Re-raise the first error with a full traceback."),
+    concurrency: int = typer.Option(None, "--concurrency", "-j", help="Parallel embed/extract calls during ingest (default: SECBRN_INGEST_CONCURRENCY)."),
+    progress: bool = typer.Option(None, "--progress/--no-progress", help="Show a live progress bar (default: on when attached to a terminal)."),
 ):
     """Ingest a file/folder or a URL into the brain (Stages 1–6)."""
     if not path and not url:
@@ -52,12 +65,39 @@ def ingest(
         raise typer.Exit(2)
     _banner()
     brain = _brain()
+    if concurrency is not None:
+        brain.s.ingest_concurrency = max(1, concurrency)
+
+    show_progress = progress if progress is not None else sys.stderr.isatty()
+
+    def _run(cb):
+        if url:
+            return brain.ingest_url(url, resolve=not no_resolve, progress=cb)
+        return brain.ingest(path, resolve=not no_resolve, raise_errors=debug, progress=cb)
+
     try:
-        rep = (
-            brain.ingest_url(url, resolve=not no_resolve)
-            if url
-            else brain.ingest(path, resolve=not no_resolve, raise_errors=debug)
-        )
+        if show_progress:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=False,
+            ) as prog:
+                tasks: dict[tuple[str, str], int] = {}
+
+                def cb(ev):
+                    key = (ev.doc_title, ev.phase)
+                    if key not in tasks:
+                        label = f"[cyan]{ev.phase}[/cyan] {ev.doc_title[:32]}"
+                        tasks[key] = prog.add_task(label, total=max(ev.total, 1))
+                    prog.update(tasks[key], completed=ev.done, total=max(ev.total, 1))
+
+                rep = _run(cb)
+        else:
+            rep = _run(None)
     finally:
         brain.close()
     failed = rep.chunks_failed + rep.extractions_failed
@@ -174,6 +214,53 @@ def reindex(
         console.print("[yellow]Now re-ingest your sources to re-embed at the new dimension.[/yellow]")
     else:
         console.print("[green]Schema/indexes ensured.[/green]")
+
+
+@app.command()
+def reset(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
+    """Delete ALL data from the graph (documents, chunks, entities, relations).
+
+    Indexes/constraints are kept, so you can immediately re-ingest. Use this when
+    idempotent dedup keeps skipping files as 'unchanged' and you want a clean reload.
+    """
+    s = get_settings()
+    backend = resolve_backend(s)
+    _banner()
+    if backend == "memory":
+        console.print(
+            "[yellow]Nothing to reset:[/yellow] the in-memory backend isn't persisted, "
+            "so each process already starts empty."
+        )
+        raise typer.Exit(0)
+
+    brain = _brain()
+    try:
+        before = brain.stats()
+        n = before.get("documents", 0) + before.get("chunks", 0) + before.get("entities", 0)
+        if n == 0:
+            console.print("[green]Graph is already empty.[/green] Nothing to delete.")
+            raise typer.Exit(0)
+        if not yes:
+            console.print(
+                f"[red]About to permanently delete ALL data[/red] from neo4j @ {s.neo4j_uri} "
+                f"(db={s.neo4j_database}):\n"
+                f"  documents={before.get('documents', 0)}  chunks={before.get('chunks', 0)}  "
+                f"entities={before.get('entities', 0)}  relations={before.get('relations', 0)}"
+            )
+            if not typer.confirm("Proceed?"):
+                console.print("Aborted — nothing was deleted.")
+                raise typer.Exit(1)
+        brain.store.clear()
+        after = brain.stats()
+    finally:
+        brain.close()
+    console.print(
+        f"[green]Graph cleared.[/green] documents={after.get('documents', 0)} "
+        f"chunks={after.get('chunks', 0)} entities={after.get('entities', 0)}"
+    )
+    console.print("Now re-ingest, e.g. [bold]secbrn ingest <path>[/bold].")
 
 
 @app.command()
@@ -315,6 +402,86 @@ def eval_cmd(
         console.print("[dim]TP=correct merges  FP=over-merges (bad)  FN=missed duplicates[/dim]")
 
 
+@app.command("eval-answers")
+def eval_answers(
+    questions: str = typer.Option("eval/answers.json", "--questions", "-q", help="Gold answers JSON (see eval/answers.example.json)."),
+    k: int = typer.Option(None, "--k", help="Chunks to retrieve per question."),
+    no_judge: bool = typer.Option(False, "--no-judge", help="Skip the LLM-as-judge; report lexical signals only."),
+    judge_model: str = typer.Option(None, "--judge-model", help="Model to grade answers (default: the answer model)."),
+    corpus: str = typer.Option(None, "--corpus", help="Ingest this folder into an isolated in-memory brain instead of using the live store (reproducible)."),
+    show_cases: bool = typer.Option(False, "--show-cases", help="Print per-question detail."),
+):
+    """Score generated ANSWERS against gold answers (LLM-judge + key-fact recall).
+
+    By default this asks your LIVE store, so you measure answer quality on the data you
+    actually ingested. Pass --corpus to grade against a fresh, isolated ingest instead.
+    """
+    from pathlib import Path
+    from secbrn.eval import AnswerEvaluator, load_answer_set
+    from secbrn.providers import get_answer_llm
+
+    if not Path(questions).exists():
+        console.print(
+            f"[red]No questions file at {questions}.[/red] Copy the template:\n"
+            "  [bold]cp eval/answers.example.json eval/answers.json[/bold]  then edit it, "
+            "or pass [bold]--questions <path>[/bold]."
+        )
+        raise typer.Exit(2)
+    cases = load_answer_set(questions)
+    _banner()
+
+    if corpus:
+        brain = Brain.isolated()
+        rep = brain.ingest(corpus)
+        console.print(f"[dim]isolated corpus {corpus} (chunks={rep.chunks_written}, merges={rep.merges})[/dim]")
+    else:
+        brain = _brain()
+
+    judge = None
+    if not no_judge:
+        if judge_model:
+            judge = get_answer_llm(get_settings().model_copy(update={"answer_model": judge_model}))
+        else:
+            judge = brain.answer_llm
+
+    try:
+        report = AnswerEvaluator(brain, judge=judge, k=k).evaluate(cases)
+    finally:
+        brain.close()
+
+    t = Table(title=f"Answer quality (n={report.n})")
+    for col in ("correct /5", "complete /5", "key-fact recall", "lexical F1", "grounded"):
+        t.add_column(col, justify="right")
+    t.add_row(
+        f"{report.judge_correct:.2f}", f"{report.judge_complete:.2f}",
+        f"{report.key_fact_recall:.2f}", f"{report.lexical_f1:.2f}",
+        f"{report.grounded_rate*100:.0f}%",
+    )
+    console.print(t)
+    if no_judge or not report.judged_by_llm:
+        console.print(
+            "[yellow]LLM judge not used[/yellow] — correct/complete are derived from lexical "
+            "overlap with your reference answers. Key-fact recall + grounded are exact."
+            if no_judge else
+            "[yellow]Judge produced no parseable scores[/yellow] (model didn't return JSON); "
+            "correct/complete fell back to lexical overlap."
+        )
+    else:
+        console.print("[dim]correct/complete graded by the LLM judge vs your reference answers.[/dim]")
+    console.print("[dim]grounded = answer carried inline citations.[/dim]")
+
+    if show_cases:
+        for r in report.per_case:
+            mark = "[green]●[/green]" if r.judge_correct >= 3 else "[red]●[/red]"
+            console.print(
+                f"  {mark} correct={r.judge_correct:.1f} complete={r.judge_complete:.1f} "
+                f"kfr={r.key_fact_recall:.2f} f1={r.lexical_f1:.2f} cites={r.n_citations}  "
+                f"[dim]{r.query}[/dim]"
+            )
+            if r.judge_reason:
+                console.print(f"      [dim]{r.judge_reason}[/dim]")
+
+
 @app.command("eval-compare")
 def eval_compare(
     extract_models: str = typer.Option(None, "--extract-models", help="Comma-separated extract models to A/B (e.g. 'llama3.1:8b,qwen2.5:7b')."),
@@ -387,7 +554,77 @@ def eval_compare(
     console.print(f"[dim]Deltas vs the first model. {hint}.[/dim]")
 
 
+@app.command("eval-sweep")
+def eval_sweep(
+    gold: str = typer.Option("eval/gold.json", "--gold"),
+    graph_boost: str = typer.Option(None, "--graph-boost", help="Comma list, e.g. '0,0.5,1.0'."),
+    title_boost: str = typer.Option(None, "--title-boost", help="Comma list, e.g. '0,0.4,0.8'."),
+    top_k: str = typer.Option(None, "--top-k", help="Comma list, e.g. '6,10'."),
+    metric: str = typer.Option("map", "--metric", help="Sort by: map | ndcg | r_precision."),
+    top: int = typer.Option(10, "--top", help="Rows to show."),
+):
+    """Grid-search retrieval params against the gold set and report the best config.
+
+    Ingests the corpus once, then sweeps graph_boost / title_boost / top_k at query time
+    (no re-ingest). Free tuning — copy the winning row into your .env.
+    """
+    from itertools import product
+    from secbrn.eval import Evaluator, load_goldset
+
+    base = get_settings()
+
+    def _vals(opt, default):
+        if not opt:
+            return [default]
+        out = []
+        for x in opt.split(","):
+            x = x.strip()
+            if x:
+                out.append(type(default)(x))
+        return out or [default]
+
+    gbs = _vals(graph_boost, base.graph_boost)
+    tbs = _vals(title_boost, base.title_boost)
+    tks = _vals(top_k, base.retrieve_top_k)
+    metric = metric.lower()
+    if metric not in ("map", "ndcg", "r_precision"):
+        console.print("[red]--metric must be map | ndcg | r_precision[/red]")
+        raise typer.Exit(2)
+
+    gs = load_goldset(gold)
+    brain = Brain.isolated(base)
+    rows = []
+    try:
+        if gs.retrieval and gs.corpus_path() is not None:
+            rep = brain.ingest(gs.corpus_path())
+            console.print(f"[dim]ingested corpus (chunks={rep.chunks_written}); sweeping "
+                          f"{len(gbs)*len(tbs)*len(tks)} combos…[/dim]")
+        for gb, tb, tk in product(gbs, tbs, tks):
+            brain.s.graph_boost = gb
+            brain.s.title_boost = tb
+            brain.s.retrieve_top_k = tk
+            r = Evaluator(brain, k=tk).evaluate(gs).retrieval
+            rows.append((gb, tb, tk, r.r_precision, r.map, r.ndcg_at_k))
+    finally:
+        brain.close()
+
+    key = {"map": 4, "ndcg": 5, "r_precision": 3}[metric]
+    rows.sort(key=lambda t: t[key], reverse=True)
+
+    t = Table(title=f"Retrieval sweep (sorted by {metric})")
+    for col in ("graph_boost", "title_boost", "top_k", "precision@R", "MAP", "nDCG@k"):
+        t.add_column(col, justify="right")
+    for gb, tb, tk, rp, mp, nd in rows[:top]:
+        t.add_row(f"{gb:g}", f"{tb:g}", str(tk), f"{rp:.3f}", f"{mp:.3f}", f"{nd:.3f}")
+    console.print(t)
+    if rows:
+        gb, tb, tk, rp, mp, nd = rows[0]
+        console.print(f"[green]Best:[/green] SECBRN_GRAPH_BOOST={gb:g} SECBRN_TITLE_BOOST={tb:g} "
+                      f"SECBRN_RETRIEVE_TOP_K={tk}  ({metric}={rows[0][key]:.3f})")
+
+
 def main():  # pragma: no cover
+    """Console-script entry point (see pyproject [project.scripts])."""
     app()
 
 

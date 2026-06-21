@@ -1,28 +1,30 @@
-"""Stage 7 — Hybrid retrieval: vector + full-text + graph + lexical signals.
+"""Stage 7 — Hybrid retrieval: vector + full-text + graph + lexical, with optional
+query expansion (pre-retrieval) and LLM reranking (post-fusion).
 
-Pipeline per query:
+Per query:
+  0. (optional) expand the query with LLM keywords for vector + full-text search.
   1. Vector search over chunk embeddings.
   2. Full-text / keyword search over chunk text.
   3. Reciprocal-rank fusion of (1) and (2).
-  4. Re-score the fused candidates with two cheap, high-signal boosts:
-       - graph boost: chunks that mention the query's *seed* entities (the entities the
-         query is literally about) are boosted strongly; chunks that only mention distant
-         graph neighbours get a small boost. This rewards relevance, not entity density.
-       - title boost: chunks whose document title / section heading shares terms with the
-         query are boosted (a doc titled "GraphRAG" should win a "knowledge graph" query).
-  5. Graph expansion from the top chunks' entities builds the answer's subgraph.
+  4. Re-score: seed-weighted graph boost + title/heading lexical boost.
+  5. (optional) listwise LLM rerank of the top candidates.
+  6. Graph expansion from the top chunks' entities builds the answer's subgraph.
 
-Interface matches neo4j-graphrag retrievers so they remain drop-in (ADR-2).
+The original query (not the expanded one) drives entity seeding and title matching, so
+expansion can't pollute those exact-term signals.
 """
 
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from secbrn.config import Settings
 from secbrn.graph.base import GraphStore
 from secbrn.models import ContextBundle, RetrievedChunk
-from secbrn.providers.base import Embedder
+from secbrn.providers.base import Embedder, LLM
+from secbrn.retrieve.expand import expand_query
+from secbrn.retrieve.rerank import LLMReranker
 
 _WORD = re.compile(r"[a-z0-9][a-z0-9\-]+")
 _NEIGHBOR_WEIGHT = 0.25  # far graph neighbours count far less than direct seed hits
@@ -33,7 +35,6 @@ def _terms(text: str) -> set[str]:
 
 
 def _fuzzy_overlap(q: set[str], target: set[str]) -> int:
-    """Count query terms that match a target term by equality/substring (>=3 chars)."""
     n = 0
     for qt in q:
         if any(qt == t or qt in t or t in qt for t in target):
@@ -62,12 +63,31 @@ def _rrf_fuse(ranked_lists: list[list[RetrievedChunk]], k: int, c: int = 60) -> 
 
 
 class HybridRetriever:
-    def __init__(self, settings: Settings, store: GraphStore, embedder: Embedder):
+    def __init__(self, settings: Settings, store: GraphStore, embedder: Embedder,
+                 llm: LLM | None = None, reranker: LLMReranker | None = None):
         self.s = settings
         self.store = store
         self.embedder = embedder
+        self.llm = llm
+        self.reranker = reranker
 
-    # ── re-scoring ────────────────────────────────────────────────────────────────
+    # ── helpers ──────────────────────────────────────────────────────────────────
+    def _search_query(self, query: str) -> str:
+        if self.s.query_expansion and self.llm is not None:
+            return expand_query(query, self.llm, self.s.query_expansion_terms)
+        return query
+
+    def _fuse(self, search_query: str, top_k: int) -> list[RetrievedChunk]:
+        # Full-text search doesn't need the query embedding, so run it in a background
+        # thread while we spend the (usually dominant) wall-clock on the embed round-trip
+        # plus the vector query. The two store reads then overlap instead of serializing.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            ft_future = pool.submit(self.store.fulltext_search, search_query, top_k)
+            qvec = self.embedder.embed_one(search_query)
+            vector_hits = self.store.vector_search(qvec, top_k)
+            fulltext_hits = ft_future.result()
+        return _rrf_fuse([vector_hits, fulltext_hits], top_k)
+
     def _rescore(self, query: str, chunks: list[RetrievedChunk], hops: int) -> list[RetrievedChunk]:
         if not chunks:
             return chunks
@@ -75,7 +95,6 @@ class HybridRetriever:
         t_alpha = self.s.title_boost
         qterms = _terms(query)
 
-        # seeds = entities the query is literally about; neighbours = within `hops`.
         seeds: set[str] = set()
         neighbors: set[str] = set()
         if g_alpha > 0:
@@ -90,9 +109,7 @@ class HybridRetriever:
             factor = 1.0
             if g_alpha > 0 and (seeds or neighbors):
                 ents = set(cmap.get(c.chunk_id, []))
-                seed_hits = len(ents & seeds)
-                neigh_hits = len(ents & neighbors)
-                gboost = g_alpha * (seed_hits + _NEIGHBOR_WEIGHT * neigh_hits)
+                gboost = g_alpha * (len(ents & seeds) + _NEIGHBOR_WEIGHT * len(ents & neighbors))
                 if gboost:
                     factor += gboost
                     if "graph" not in c.via:
@@ -109,33 +126,29 @@ class HybridRetriever:
         chunks.sort(key=lambda c: c.score, reverse=True)
         return chunks
 
+    def _maybe_rerank(self, query: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        if self.s.rerank and self.reranker is not None and len(chunks) > 1:
+            return self.reranker.rerank(query, chunks, self.s.rerank_candidates)
+        return chunks
+
     # ── public API ────────────────────────────────────────────────────────────────
     def retrieve(self, query: str, *, top_k: int | None = None, hops: int | None = None) -> ContextBundle:
         top_k = top_k or self.s.retrieve_top_k
         hops = self.s.retrieve_hops if hops is None else hops
 
-        qvec = self.embedder.embed_one(query)
-        vector_hits = self.store.vector_search(qvec, top_k)
-        fulltext_hits = self.store.fulltext_search(query, top_k)
-
-        fused = _rrf_fuse([vector_hits, fulltext_hits], top_k)
+        fused = self._fuse(self._search_query(query), top_k)
         fused = self._rescore(query, fused, hops)
+        fused = self._maybe_rerank(query, fused)
 
-        # Graph expansion from entities mentioned in the fused chunks (for the subgraph).
         seed_entities = self.store.entities_for_chunks([rc.chunk_id for rc in fused])
         edges, entities = ([], seed_entities)
         if seed_entities and hops > 0:
             edges, entities = self.store.expand(seed_entities, hops)
-
         return ContextBundle(chunks=fused, edges=edges, entities=entities)
 
     def search(self, query: str, *, top_k: int | None = None, hops: int | None = None) -> list[RetrievedChunk]:
-        """Hybrid chunk search with graph + title re-scoring (no subgraph assembly)."""
         top_k = top_k or self.s.retrieve_top_k
         hops = self.s.retrieve_hops if hops is None else hops
-        qvec = self.embedder.embed_one(query)
-        fused = _rrf_fuse(
-            [self.store.vector_search(qvec, top_k), self.store.fulltext_search(query, top_k)],
-            top_k,
-        )
-        return self._rescore(query, fused, hops)
+        fused = self._fuse(self._search_query(query), top_k)
+        fused = self._rescore(query, fused, hops)
+        return self._maybe_rerank(query, fused)

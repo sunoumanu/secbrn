@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from secbrn.answer import synthesize
 from secbrn.config import Settings, get_settings
@@ -25,10 +26,32 @@ from secbrn.ingest import (
     normalize_and_dedupe,
 )
 from secbrn.models import Answer, Document, RetrievedChunk
-from secbrn.providers import get_answer_llm, get_embedder, get_extract_llm
+from secbrn.providers import get_answer_llm, get_embedder, get_extract_llm, get_rerank_llm
 from secbrn.providers.base import Embedder, LLM
 from secbrn.resolve import EntityResolver, MergeDecision
 from secbrn.retrieve import HybridRetriever
+from secbrn.retrieve.rerank import LLMReranker
+from secbrn.util import map_workers
+
+
+@dataclass
+class IngestProgress:
+    """A single progress tick emitted during ingest, for a CLI/UI to render.
+
+    ``phase`` is "embed" or "extract"; ``done``/``total`` count chunks within the
+    current document's current phase. A tick with ``done == 0`` marks phase start
+    (so a UI can create/size a bar before any work completes).
+    """
+
+    phase: str
+    doc_title: str
+    done: int
+    total: int
+
+
+# A progress sink: called with each IngestProgress event. Kept as a plain callable so
+# the engine stays UI-agnostic (the CLI wires this to a rich progress bar).
+ProgressFn = Callable[[IngestProgress], None]
 
 
 @dataclass
@@ -59,7 +82,9 @@ class Brain:
         self.embedder = embedder
         self.extract_llm = extract_llm
         self.answer_llm = answer_llm
-        self.retriever = HybridRetriever(settings, store, embedder)
+        rerank_llm = get_rerank_llm(settings)
+        reranker = LLMReranker(rerank_llm) if settings.rerank else None
+        self.retriever = HybridRetriever(settings, store, embedder, llm=rerank_llm, reranker=reranker)
         self.store.ensure_schema()
 
     # -- construction -----------------------------------------------------------------
@@ -102,20 +127,23 @@ class Brain:
         self.close()
 
     # -- write path (Stages 1-6) ------------------------------------------------------
-    def ingest(self, path: str | Path, *, resolve: bool = True, raise_errors: bool = False) -> IngestReport:
+    def ingest(self, path: str | Path, *, resolve: bool = True, raise_errors: bool = False,
+               progress: ProgressFn | None = None) -> IngestReport:
         """Ingest a file or folder. Idempotent: unchanged files are skipped.
 
         Resilient by design: a bad *file* is logged to ``report.details`` and ingestion
         continues; a bad *chunk* (e.g. an Ollama timeout) is skipped without discarding
         the rest of the document. Pass ``raise_errors=True`` (CLI ``--debug``) to
-        re-raise the first failure with a full traceback.
+        re-raise the first failure with a full traceback. ``progress`` (optional)
+        receives :class:`IngestProgress` ticks for a live progress display.
         """
         p = Path(path)
         files = iter_folder(p) if p.is_dir() else [p]
         report = IngestReport()
         for f in files:
             try:
-                self._ingest_document(load_path(f), report, raise_errors=raise_errors)
+                self._ingest_document(load_path(f), report, raise_errors=raise_errors,
+                                      progress=progress)
             except Exception as e:  # keep going on a bad file
                 if raise_errors:
                     raise
@@ -125,14 +153,16 @@ class Brain:
         return report
 
     def ingest_url(self, url: str, *, html: str | None = None, resolve: bool = True,
-                   raise_errors: bool = False) -> IngestReport:
+                   raise_errors: bool = False, progress: ProgressFn | None = None) -> IngestReport:
         report = IngestReport()
-        self._ingest_document(load_web(url, html=html), report, raise_errors=raise_errors)
+        self._ingest_document(load_web(url, html=html), report, raise_errors=raise_errors,
+                              progress=progress)
         if resolve:
             report.merges = len(self.resolve())
         return report
 
-    def _ingest_document(self, doc: Document, report: IngestReport, *, raise_errors: bool = False) -> None:
+    def _ingest_document(self, doc: Document, report: IngestReport, *, raise_errors: bool = False,
+                         progress: ProgressFn | None = None) -> None:
         # Stage 2 -- normalize + dedupe/version
         result = normalize_and_dedupe(doc, self.store)
         if result.status == "duplicate":
@@ -151,31 +181,68 @@ class Brain:
         # Stage 3 -- chunk
         chunks = chunk_document(doc, chunk_size=self.s.chunk_size, overlap=self.s.chunk_overlap)
 
-        # Stages 4 + 5 -- embed/write then extract, PER CHUNK so one failure (e.g. a
-        # ReadTimeout on a huge PDF) skips just that chunk instead of aborting the doc.
-        written: list = []
-        for c in chunks:
-            try:
-                c.embedding = self.embedder.embed_one(c.text)
-                c.embed_model = self.embedder.model
-                c.embed_dim = self.embedder.dim
-                self.store.upsert_chunk(c)
-                written.append(c)
-                report.chunks_written += 1
-            except Exception as e:
-                if raise_errors:
-                    raise
-                report.chunks_failed += 1
-                report.details.append(f"embed failed [{doc.title} chunk {c.position}]: {type(e).__name__}: {e}")
+        # Stages 4 + 5 -- embed then extract, PER CHUNK so one failure (e.g. a ReadTimeout
+        # on a huge PDF) skips just that chunk instead of aborting the doc.
+        #
+        # The embed and extract calls are blocking Ollama round-trips and are the dominant
+        # ingest cost, so we run them with bounded concurrency (``ingest_concurrency``).
+        # Only the *network* work is parallel: every store write stays on this thread, in
+        # chunk order, so resilience reporting and Neo4j access remain serial and
+        # deterministic. ``map_workers`` returns one (result, exc) per chunk IN ORDER, so
+        # the previous per-chunk try/except semantics are preserved exactly.
+        workers = self.s.ingest_concurrency
 
-        for c in written:
-            try:
-                ex = extract_chunk(c.text, self.extract_llm)
-            except Exception as e:
+        # Stage 4 -- embed (concurrent), then write (serial, ordered).
+        written: list = []
+        emb_done = 0
+
+        def _emb_tick() -> None:
+            nonlocal emb_done
+            emb_done += 1
+            if progress is not None:
+                progress(IngestProgress("embed", doc.title, emb_done, len(chunks)))
+
+        if progress is not None and chunks:
+            progress(IngestProgress("embed", doc.title, 0, len(chunks)))
+        embeddings = map_workers(self.embedder.embed_one, [c.text for c in chunks], workers,
+                                 on_complete=_emb_tick)
+        for c, (vec, err) in zip(chunks, embeddings):
+            if err is not None:
                 if raise_errors:
-                    raise
+                    raise err
+                report.chunks_failed += 1
+                report.details.append(f"embed failed [{doc.title} chunk {c.position}]: {type(err).__name__}: {err}")
+                continue
+            c.embedding = vec
+            c.embed_model = self.embedder.model
+            c.embed_dim = self.embedder.dim
+            self.store.upsert_chunk(c)
+            written.append(c)
+            report.chunks_written += 1
+
+        # Stage 5 -- extract (concurrent), then write (serial, ordered).
+        ext_done = 0
+
+        def _ext_tick() -> None:
+            nonlocal ext_done
+            ext_done += 1
+            if progress is not None:
+                progress(IngestProgress("extract", doc.title, ext_done, len(written)))
+
+        if progress is not None and written:
+            progress(IngestProgress("extract", doc.title, 0, len(written)))
+        extractions = map_workers(
+            lambda text: extract_chunk(text, self.extract_llm),
+            [c.text for c in written],
+            workers,
+            on_complete=_ext_tick,
+        )
+        for c, (ex, err) in zip(written, extractions):
+            if err is not None:
+                if raise_errors:
+                    raise err
                 report.extractions_failed += 1
-                report.details.append(f"extract failed [{doc.title} chunk {c.position}]: {type(e).__name__}: {e}")
+                report.details.append(f"extract failed [{doc.title} chunk {c.position}]: {type(err).__name__}: {err}")
                 continue
             for ent in ex.entities:
                 self.store.upsert_entity(ent.name, ent.label, ent.aliases, ent.summary)

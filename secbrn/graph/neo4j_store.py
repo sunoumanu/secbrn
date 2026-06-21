@@ -64,6 +64,16 @@ class Neo4jStore(GraphStore):
     def close(self) -> None:
         self._driver.close()
 
+    def clear(self) -> None:
+        """Delete every node (and its relationships); keep constraints + indexes.
+
+        Batched via ``CALL { … } IN TRANSACTIONS`` so a large graph doesn't blow the
+        heap in one transaction. Runs in auto-commit mode (required by IN TRANSACTIONS).
+        """
+        self._run(
+            "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+        )
+
     def ping(self) -> bool:
         try:
             self._run("RETURN 1 AS ok")

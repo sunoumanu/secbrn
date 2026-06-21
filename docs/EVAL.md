@@ -140,3 +140,49 @@ re-ingest. Common local embedding dimensions:
 
 If you don't know a model's dimension, run `secbrn eval-compare --embed-models <name>,<name>`
 once (it auto-detects), or check the model card.
+
+## Tuning + advanced retrieval levers
+
+Once model choices are settled, these squeeze out the remaining points. Tune them with
+the eval harness — the right values are corpus- and model-dependent (don't assume the
+defaults are optimal).
+
+### Parameter sweep (free)
+
+```bash
+secbrn eval-sweep --graph-boost "0,0.5,1.0" --title-boost "0,0.4,0.8" --top-k "6,10" --metric map
+```
+
+Ingests the corpus once, grid-searches the retrieval-time params, and prints the best
+config to copy into `.env`. Note: graph_boost / title_boost can *hurt* on some
+corpora — the sweep is how you find out instead of guessing.
+
+### Reranking (Stage 7.5)
+
+A listwise LLM rerank of the fused top candidates — usually the biggest precision/nDCG
+lever. One extra LLM call per query, off by default:
+
+```bash
+SECBRN_RERANK=true SECBRN_RERANK_CANDIDATES=10 secbrn eval --gold eval/gold.json
+# optional: SECBRN_RERANK_MODEL=qwen2.5:7b  (defaults to SECBRN_ANSWER_MODEL)
+```
+
+It falls back to the fused order if the model returns anything unparseable, so it can't
+silently corrupt ranking.
+
+### Query expansion (Stage 7)
+
+The LLM adds keywords/phrasings to the query before vector + full-text search, helping
+paraphrase questions match. The original query still drives entity seeding and title
+matching. Off by default:
+
+```bash
+SECBRN_QUERY_EXPANSION=true secbrn eval --gold eval/gold.json
+```
+
+### Recommended order
+
+1. `eval-sweep` to fix graph_boost / title_boost / top_k for your data (free).
+2. Turn on `SECBRN_RERANK` and re-run `eval` — keep it if precision@R / nDCG improve.
+3. Turn on `SECBRN_QUERY_EXPANSION` and re-run — keep it if recall / MAP improve.
+4. Combine the winners; set them in `.env`; for the real store, re-run `secbrn eval --use-existing`.

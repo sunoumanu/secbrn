@@ -46,14 +46,23 @@ class Settings(BaseSettings):
     #   "memory" -> always the in-process store (NOT persistent across processes)
     graph_backend: str = "auto"
 
-    embed_model: str = "nomic-embed-text"
-    embed_dim: int = 768
-    extract_model: str = "llama3.1:8b"
-    answer_model: str = "llama3.1:8b"
+    embed_model: str = "bge-large"
+    embed_dim: int = 1024
+    extract_model: str = "qwen2.5:7b"
+    answer_model: str = "qwen2.5:7b"
 
     # Chunking
     chunk_size: int = 900
     chunk_overlap: int = 120
+
+    # Ingest concurrency: how many per-chunk Ollama calls (embed in Stage 4, KG
+    # extraction in Stage 5) may be in flight at once. These are blocking network
+    # round-trips, so overlapping them is the dominant ingest speed-up. 1 = strictly
+    # sequential (old behaviour). Keep <= Ollama's OLLAMA_NUM_PARALLEL to avoid queueing.
+    ingest_concurrency: int = 4
+    # Concurrency for the resolver's entity-context-embedding fetches (Stage 6). These
+    # are independent read round-trips to the store; 1 = sequential.
+    resolve_concurrency: int = 4
 
     # Entity resolution thresholds (Stage 6)
     res_similarity_threshold: float = 0.86
@@ -69,6 +78,17 @@ class Settings(BaseSettings):
     graph_boost: float = 0.5
     # Lexical boost when query terms appear in a chunk's document title / section heading.
     title_boost: float = 0.4
+
+    # Query expansion (Stage 7 pre-retrieval): LLM adds keywords/phrasings to the query
+    # before vector + full-text search. Helps paraphrase queries. Off by default.
+    query_expansion: bool = False
+    query_expansion_terms: int = 6
+
+    # Reranking (Stage 7.5): listwise LLM rerank of the fused top candidates. Off by
+    # default (adds one LLM call per query). rerank_model empty => use answer_model.
+    rerank: bool = False
+    rerank_candidates: int = 10
+    rerank_model: str = ""
 
     # Optional JSON alias-seed map for known troublemakers
     alias_seed_path: str | None = Field(default=None)

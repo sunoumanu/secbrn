@@ -18,6 +18,7 @@ __all__ = [
     "get_embedder",
     "get_extract_llm",
     "get_answer_llm",
+    "get_rerank_llm",
 ]
 
 
@@ -52,6 +53,19 @@ def get_answer_llm(settings: Settings) -> LLM:
     return OllamaLLM(
         base_url=settings.ollama_base_url,
         model=settings.answer_model,
+        timeout=settings.ollama_llm_timeout,
+        max_retries=settings.ollama_max_retries,
+        backoff=settings.ollama_retry_backoff,
+    )
+
+
+def get_rerank_llm(settings: Settings) -> LLM:
+    """LLM used for reranking + query expansion. Uses rerank_model if set, else answer_model."""
+    if settings.provider == "fake":
+        return FakeLLM(model="fake-rerank")
+    return OllamaLLM(
+        base_url=settings.ollama_base_url,
+        model=settings.rerank_model or settings.answer_model,
         timeout=settings.ollama_llm_timeout,
         max_retries=settings.ollama_max_retries,
         backoff=settings.ollama_retry_backoff,

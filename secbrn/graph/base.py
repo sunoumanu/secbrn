@@ -50,6 +50,14 @@ class GraphStore(ABC):
     def close(self) -> None: ...
 
     @abstractmethod
+    def clear(self) -> None:
+        """Delete ALL data (documents, chunks, entities, relations, history).
+
+        Leaves schema (constraints + indexes) intact so the store is immediately
+        ready for a fresh ingest. Irreversible.
+        """
+
+    @abstractmethod
     def ping(self) -> bool: ...
 
     @abstractmethod
