@@ -1,0 +1,44 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: secbrn-neo4j
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt
+    environment:
+      # username is always "neo4j"; password set here must match SECBRN_NEO4J_PASSWORD
+      NEO4J_AUTH: neo4j/secbrnsecbrn
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 2G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Optional: run Ollama in a container. If you already run Ollama natively,
+  # comment this out and point SECBRN_OLLAMA_BASE_URL at your host instance.
+  #ollama:
+    #image: ollama/ollama:latest
+    #container_name: secbrn-ollama
+    #ports:
+    #  - "11434:11434"
+    #volumes:
+    #  - ollama_data:/root/.ollama
+    # Uncomment for NVIDIA GPU acceleration:
+    #deploy:
+    #  resources:
+    #    reservations:
+    #      devices:
+    #        - driver: nvidia
+    #          count: all
+    #          capabilities: [gpu]
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  #ollama_data:

@@ -1,0 +1,3 @@
+[00:01] Alice: Today we discuss retrieval quality and how reranking helps.
+[00:05] Bob: Right, a cross-encoder reranker improves retrieval after the vector search.
+[00:09] Alice: We should store embeddings in Neo4j rather than pgvector for the graph.

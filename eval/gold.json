@@ -1,0 +1,43 @@
+{
+  "corpus": "../tests/fixtures",
+  "retrieval": [
+    {"query": "how does reranking improve retrieval quality",
+     "relevant": ["Retrieval Notes", "Rerankers"]},
+    {"query": "what is a cross-encoder used for",
+     "relevant": ["Rerankers"]},
+    {"query": "vector database alternative to neo4j",
+     "relevant": ["Tooling"]},
+    {"query": "graph expansion traversing relationships",
+     "relevant": ["Retrieval Notes", "GraphRAG"]},
+    {"query": "what embedding model produces 768 dimensional vectors",
+     "relevant": ["Embeddings"]},
+    {"query": "cosine similarity nearest neighbour search",
+     "relevant": ["Embeddings"]},
+    {"query": "multi-hop reasoning over a knowledge graph",
+     "relevant": ["GraphRAG"]},
+    {"query": "which tool serves local embedding and generation models",
+     "relevant": ["Tooling"]}
+  ],
+  "extraction": [
+    {"text": "Reranking improves Retrieval.",
+     "entities": [["Reranking", "Concept"], ["Retrieval", "Concept"]],
+     "triples": [["Reranking", "IMPROVES", "Retrieval"]]},
+    {"text": "pgvector is an alternative to Neo4j for vector storage.",
+     "entities": [["pgvector", "Tool"], ["Neo4j", "Tool"]],
+     "triples": [["pgvector", "ALTERNATIVE_TO", "Neo4j"]]},
+    {"text": "LlamaIndex uses Ollama for local inference.",
+     "entities": [["LlamaIndex", "Tool"], ["Ollama", "Tool"]],
+     "triples": [["LlamaIndex", "USES", "Ollama"]]}
+  ],
+  "resolution": [
+    {"entities": [["pgvector", "Tool"], ["PGVector", "Tool"], ["Pgvector", "Tool"], ["Neo4j", "Tool"]],
+     "should_merge": [["pgvector", "PGVector"], ["pgvector", "Pgvector"]],
+     "should_not_merge": [["pgvector", "Neo4j"]]},
+    {"entities": [["Reranking", "Concept"], ["Rerankng", "Concept"], ["Retrieval", "Concept"]],
+     "should_merge": [["Reranking", "Rerankng"]],
+     "should_not_merge": [["Reranking", "Retrieval"]]},
+    {"entities": [["Neo4j", "Tool"], ["neo4j", "Tool"], ["NEO4J", "Tool"], ["Ollama", "Tool"]],
+     "should_merge": [["Neo4j", "neo4j"], ["Neo4j", "NEO4J"]],
+     "should_not_merge": [["Neo4j", "Ollama"]]}
+  ]
+}
