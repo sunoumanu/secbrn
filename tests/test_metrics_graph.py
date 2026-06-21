@@ -115,3 +115,40 @@ def test_seed_hit_beats_neighbor_only():
     r = HybridRetriever(s, store, emb)
     hits = r.search("reranking")  # seed = Reranking
     assert hits[0].document_title == "A"  # seed hit (weight 1) beats neighbour (weight 0.25)
+
+
+def test_fake_embedder_auto_dim_sentinel():
+    # dim=0 (auto sentinel from A/B runs) must still yield a usable vector
+    e = FakeEmbedder(dim=0)
+    v = e.embed_one("hello world")
+    assert e.dim == 256 and len(v) == 256
+
+
+def test_inmemory_recreate_vector_index_is_noop():
+    from secbrn.graph.memory import InMemoryStore
+    s = InMemoryStore()
+    s.ensure_schema()
+    s.recreate_vector_index()  # must not raise
+    assert s.indexes_present()["chunk_vec"] is True
+
+
+def test_embed_model_ab_runs_offline():
+    """A/B over embedding models works in the dim-agnostic in-memory store."""
+    from pathlib import Path
+    from secbrn.config import get_settings
+    from secbrn.eval import Evaluator, load_goldset
+    from secbrn.pipeline import Brain
+
+    gold = Path(__file__).parent.parent / "eval" / "gold.json"
+    gs = load_goldset(gold)
+    base = get_settings().model_copy(update={"provider": "fake"})
+    reports = []
+    for m in ("nomic-embed-text", "all-minilm"):
+        s2 = base.model_copy(update={"embed_model": m, "embed_dim": 0})
+        brain = Brain.isolated(s2)
+        try:
+            brain.ingest(gs.corpus_path(), resolve=False)
+            reports.append(Evaluator(brain).evaluate(gs))
+        finally:
+            brain.close()
+    assert all(r.retrieval is not None for r in reports)

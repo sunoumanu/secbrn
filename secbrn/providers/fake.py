@@ -22,7 +22,7 @@ def _tokens(text: str) -> list[str]:
 
 class FakeEmbedder:
     def __init__(self, dim: int = 768, model: str = "fake-embed"):
-        self.dim = dim
+        self.dim = dim if dim and dim > 0 else 256  # 0 = 'auto' sentinel from A/B runs
         self.model = model
 
     def embed_one(self, text: str) -> list[float]:

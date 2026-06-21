@@ -160,14 +160,20 @@ def resolve():
 
 
 @app.command()
-def reindex():
-    """Re-apply schema DDL (constraints + indexes)."""
+def reindex(
+    recreate: bool = typer.Option(False, "--recreate", help="Drop & recreate the vector index at the configured SECBRN_EMBED_DIM (use after changing the embedding model)."),
+):
+    """Re-apply schema DDL (constraints + indexes); optionally recreate the vector index."""
     brain = _brain()
     try:
-        brain.reindex()
+        brain.reindex(recreate=recreate)
     finally:
         brain.close()
-    console.print("[green]Schema/indexes ensured.[/green]")
+    if recreate:
+        console.print("[green]Vector index recreated at the configured dimension.[/green]")
+        console.print("[yellow]Now re-ingest your sources to re-embed at the new dimension.[/yellow]")
+    else:
+        console.print("[green]Schema/indexes ensured.[/green]")
 
 
 @app.command()
@@ -225,6 +231,15 @@ def doctor():
                 "`secbrn ingest <path> --debug`), or you're viewing a different database "
                 f"in Neo4j Browser than '{s.neo4j_database}'."
             )
+        sample_dim = store.sample_chunk_embed_dim()
+        if sample_dim is not None and sample_dim != s.embed_dim:
+            console.print(
+                f"\n[red]✗ embedding-dim mismatch:[/red] chunks were embedded at "
+                f"{sample_dim} dims but SECBRN_EMBED_DIM={s.embed_dim}. You changed the "
+                f"embedding model — run [bold]secbrn reindex --recreate[/bold] then re-ingest."
+            )
+        elif sample_dim is not None:
+            console.print(f"  [green]✓[/green] embedding dim {sample_dim} matches config")
     finally:
         store.close()
 
@@ -302,27 +317,42 @@ def eval_cmd(
 
 @app.command("eval-compare")
 def eval_compare(
-    extract_models: str = typer.Option(..., "--extract-models", help="Comma-separated extract models to A/B, e.g. 'llama3.1:8b,qwen2.5:7b'."),
+    extract_models: str = typer.Option(None, "--extract-models", help="Comma-separated extract models to A/B (e.g. 'llama3.1:8b,qwen2.5:7b')."),
+    embed_models: str = typer.Option(None, "--embed-models", help="Comma-separated EMBEDDING models to A/B (e.g. 'nomic-embed-text,mxbai-embed-large'). Dimensions auto-detected."),
     gold: str = typer.Option("eval/gold.json", "--gold", help="Gold-set path."),
     k: int = typer.Option(None, "--k", help="Retrieval cutoff k."),
 ):
-    """A/B several SECBRN_EXTRACT_MODELs on the same gold set and print a delta table.
+    """A/B several models on the same gold set and print a delta table.
 
-    Each model re-ingests the gold corpus into an isolated in-memory brain (real
-    embeddings + that extract model), so the comparison is apples-to-apples.
+    Vary EITHER --extract-models (moves the graph: ext/triple/res F1) OR --embed-models
+    (moves retrieval: precision@R / MAP / nDCG). Each variant re-ingests the gold corpus
+    into an isolated in-memory brain, which is dimension-agnostic, so embedding models of
+    different dimensions can be compared with no Neo4j index changes.
     """
     from secbrn.eval import Evaluator, load_goldset
 
+    if bool(extract_models) == bool(embed_models):
+        console.print("[red]Pass exactly one of --extract-models or --embed-models.[/red]")
+        raise typer.Exit(2)
+
     gs = load_goldset(gold)
     base = get_settings()
-    models = [m.strip() for m in extract_models.split(",") if m.strip()]
-    if len(models) < 2:
-        console.print("[yellow]Give at least two --extract-models to compare.[/yellow]")
     cp = gs.corpus_path()
+
+    if embed_models:
+        varying, values, title = "embed_model", [m.strip() for m in embed_models.split(",") if m.strip()], "Model A/B (embedding model)"
+    else:
+        varying, values, title = "extract_model", [m.strip() for m in extract_models.split(",") if m.strip()], "Model A/B (extract model)"
+    if len(values) < 2:
+        console.print("[yellow]Give at least two models to compare.[/yellow]")
+
     results = []
-    for m in models:
-        s2 = base.model_copy(update={"extract_model": m})
-        console.print(f"[dim]running extract_model={m} (embed={s2.embed_model})…[/dim]")
+    for m in values:
+        update = {varying: m}
+        if varying == "embed_model":
+            update["embed_dim"] = 0  # auto-detect; in-memory store doesn't need a fixed dim
+        s2 = base.model_copy(update=update)
+        console.print(f"[dim]running {varying}={m}…[/dim]")
         brain = Brain.isolated(s2)
         try:
             if gs.retrieval and cp is not None:
@@ -332,8 +362,8 @@ def eval_compare(
             brain.close()
         results.append((m, rep))
 
-    t = Table(title="Model A/B (extract model)")
-    for col in ("extract model", "ext.F1", "triple.F1", "res.F1", "precision@R", "MAP", "nDCG@k"):
+    t = Table(title=title)
+    for col in (varying.replace("_", " "), "ext.F1", "triple.F1", "res.F1", "precision@R", "MAP", "nDCG@k"):
         t.add_column(col, justify="right")
     base_metrics = None
     for m, rep in results:
@@ -351,8 +381,10 @@ def eval_compare(
             cells = [f"{x:.2f} ({x-b:+.2f})" for x, b in zip(cur, base_metrics)]
         t.add_row(m, *cells)
     console.print(t)
-    console.print("[dim]Deltas are vs the first model. ext/triple/res measure the graph; "
-                  "retrieval barely moves unless you also change the embedding model.[/dim]")
+    hint = ("retrieval columns move with the embedding model; graph columns stay flat"
+            if embed_models else
+            "graph columns (ext/triple/res) move with the extract model; retrieval stays flat")
+    console.print(f"[dim]Deltas vs the first model. {hint}.[/dim]")
 
 
 def main():  # pragma: no cover

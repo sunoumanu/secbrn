@@ -59,11 +59,15 @@ class OllamaEmbedder:
     def embed_one(self, text: str) -> list[float]:
         data = self._c.post("/api/embeddings", {"model": self.model, "prompt": text})
         vec = data["embedding"]
-        if len(vec) != self.dim:
+        # dim=0 means "trust the model" (used for A/B in the dim-agnostic in-memory store).
+        if self.dim and len(vec) != self.dim:
             raise ValueError(
                 f"Embedding dim mismatch: model '{self.model}' returned {len(vec)}, "
-                f"config SECBRN_EMBED_DIM={self.dim}. Update the vector index + config."
+                f"config SECBRN_EMBED_DIM={self.dim}. Update SECBRN_EMBED_DIM and recreate "
+                f"the vector index (secbrn reindex --recreate), then re-ingest."
             )
+        if not self.dim:
+            self.dim = len(vec)
         return vec
 
 

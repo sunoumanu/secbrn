@@ -46,6 +46,9 @@ class InMemoryStore(GraphStore):
     def ensure_schema(self) -> None:
         self._schema_ready = True
 
+    def recreate_vector_index(self) -> None:
+        pass  # in-memory store is dimension-agnostic
+
     def close(self) -> None:
         pass
 

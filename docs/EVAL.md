@@ -98,3 +98,45 @@ embedding models instead, change `SECBRN_EMBED_MODEL` + `SECBRN_EMBED_DIM` and r
    extraction model only affects data written at ingest time) and re-run `secbrn eval`.
 4. Repoint `corpus` in `eval/gold.json` at your own notes and add real questions so the
    numbers reflect your actual usage.
+
+## Changing the embedding model
+
+The embedding model drives retrieval quality. Two paths:
+
+### Measure first (no commitment)
+
+A/B embedding models against the gold set without touching Neo4j — the eval runs in a
+dimension-agnostic in-memory store, so models of different dimensions just work:
+
+```bash
+secbrn eval-compare --embed-models "nomic-embed-text,mxbai-embed-large,bge-large"
+```
+
+The retrieval columns (precision@R / MAP / nDCG) are the ones that move here.
+
+### Switch for real (persisted in Neo4j)
+
+The Neo4j vector index has a fixed dimension, so a model with a different dimension needs
+the index recreated and a full re-embed:
+
+```bash
+ollama pull mxbai-embed-large
+# in .env:  SECBRN_EMBED_MODEL=mxbai-embed-large   SECBRN_EMBED_DIM=1024
+secbrn reindex --recreate     # drops & recreates chunk_vec at the new dimension
+secbrn ingest ./my-notes/     # re-embeds everything (idempotent)
+secbrn doctor                 # verifies stored chunk dim matches the config
+```
+
+`secbrn doctor` now flags a dim mismatch if you change the model but forget to recreate +
+re-ingest. Common local embedding dimensions:
+
+| model | dimensions |
+|---|---|
+| nomic-embed-text | 768 |
+| mxbai-embed-large | 1024 |
+| bge-large (bge-large-en) | 1024 |
+| bge-m3 | 1024 |
+| all-minilm | 384 |
+
+If you don't know a model's dimension, run `secbrn eval-compare --embed-models <name>,<name>`
+once (it auto-detects), or check the model card.

@@ -206,6 +206,9 @@ class Brain:
     def stats(self) -> dict[str, int]:
         return self.store.stats()
 
-    def reindex(self) -> None:
-        """Re-apply DDL (idempotent). Full re-embed would go here when model changes."""
+    def reindex(self, *, recreate: bool = False) -> None:
+        """Re-apply DDL (idempotent). With recreate=True, drop+recreate the vector index
+        at the configured dimension (needed after switching embedding models)."""
         self.store.ensure_schema()
+        if recreate:
+            self.store.recreate_vector_index()

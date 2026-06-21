@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from secbrn.graph.base import DocRef, GraphStore, StoredEntity
-from secbrn.graph.ddl import all_ddl
+from secbrn.graph.ddl import all_ddl, vector_index_ddl
 from secbrn.models import Chunk, Document, RetrievedChunk, Span, SubgraphEdge
 
 try:  # neo4j is an install dep, but keep import soft so `fake`/in-memory works without it
@@ -46,6 +46,20 @@ class Neo4jStore(GraphStore):
     def ensure_schema(self) -> None:
         for stmt in all_ddl(self._embed_dim):
             self._run(stmt)
+
+    def recreate_vector_index(self) -> None:
+        """Drop and recreate the chunk vector index at the configured dimension.
+
+        Needed when switching to an embedding model with a different dimension.
+        """
+        self._run("DROP INDEX chunk_vec IF EXISTS")
+        self._run(vector_index_ddl(self._embed_dim))
+
+    def sample_chunk_embed_dim(self) -> int | None:
+        rows = self._run(
+            "MATCH (c:Chunk) WHERE c.embed_dim IS NOT NULL RETURN c.embed_dim AS d LIMIT 1"
+        )
+        return rows[0]["d"] if rows else None
 
     def close(self) -> None:
         self._driver.close()
