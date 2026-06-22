@@ -44,8 +44,29 @@ class Neo4jStore(GraphStore):
 
     # ── lifecycle ────────────────────────────────────────────────────────────────
     def ensure_schema(self) -> None:
+        # Self-heal a stale vector index. The DDL creates chunk_vec with
+        # ``IF NOT EXISTS``, so if an index already exists at a different dimension
+        # (e.g. you switched embedding models 768 → 1024) it would be silently kept
+        # and vector_search would later fail with a dim-mismatch ClientError. Detect
+        # that here and drop the old index so the DDL below recreates it correctly.
+        existing_dim = self.vector_index_dim()
+        if existing_dim is not None and existing_dim != self._embed_dim:
+            self._run("DROP INDEX chunk_vec IF EXISTS")
         for stmt in all_ddl(self._embed_dim):
             self._run(stmt)
+
+    def vector_index_dim(self) -> int | None:
+        """Dimension the ``chunk_vec`` vector index was created with, or None if absent."""
+        rows = self._run(
+            "SHOW INDEXES YIELD name, options "
+            "WHERE name = 'chunk_vec' RETURN options AS options"
+        )
+        if not rows:
+            return None
+        opts = rows[0]["options"] or {}
+        cfg = opts.get("indexConfig") or {}
+        dim = cfg.get("vector.dimensions")
+        return int(dim) if dim is not None else None
 
     def recreate_vector_index(self) -> None:
         """Drop and recreate the chunk vector index at the configured dimension.
@@ -67,11 +88,11 @@ class Neo4jStore(GraphStore):
     def clear(self) -> None:
         """Delete every node (and its relationships); keep constraints + indexes.
 
-        Batched via ``CALL { … } IN TRANSACTIONS`` so a large graph doesn't blow the
+        Batched via ``CALL (n) { … } IN TRANSACTIONS`` so a large graph doesn't blow the
         heap in one transaction. Runs in auto-commit mode (required by IN TRANSACTIONS).
         """
         self._run(
-            "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+            "MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
         )
 
     def ping(self) -> bool:
@@ -139,6 +160,18 @@ class Neo4jStore(GraphStore):
             span=_span_to_json(chunk.span), embed_model=chunk.embed_model,
             embed_dim=chunk.embed_dim, embedding=chunk.embedding,
         )
+
+    def update_chunk_span(self, chunk_id: str, span: Span) -> bool:
+        """Rewrite just a chunk's citation span in place (no embed/extract touched).
+
+        Used by the span backfill to repair chunks ingested before line spans were
+        computed correctly. Returns True if a chunk with that id existed.
+        """
+        rows = self._run(
+            "MATCH (c:Chunk {id:$id}) SET c.span=$span RETURN count(c) AS n",
+            id=chunk_id, span=_span_to_json(span),
+        )
+        return bool(rows and rows[0]["n"])
 
     def upsert_entity(self, name: str, label: str, aliases: list[str], summary: str = "") -> None:
         # Apply both :Entity and the semantic label. Label is parameterised via APOC-free
@@ -247,8 +280,7 @@ class Neo4jStore(GraphStore):
             MATCH (dup:Entity {name:$dup})
             MATCH (canon:Entity {name:$canon})
             // move incoming MENTIONS
-            CALL {
-              WITH dup, canon
+            CALL (dup, canon) {
               MATCH (c)-[m:MENTIONS]->(dup)
               MERGE (c)-[:MENTIONS]->(canon)
               DELETE m

@@ -57,9 +57,20 @@ def _safe_json(raw: str) -> dict:
 
 
 def _validate(data: dict) -> Extraction:
+    # Models sometimes return a bare list, a string, or null instead of the
+    # expected object; coerce anything non-dict to an empty result.
+    if not isinstance(data, dict):
+        data = {}
     label_by_name: dict[str, str] = {}
     entities: list[ExtractedEntity] = []
-    for e in data.get("entities", []) or []:
+    raw_entities = data.get("entities", []) or []
+    if not isinstance(raw_entities, list):
+        raw_entities = []
+    for e in raw_entities:
+        # Skip malformed items (e.g. bare strings) so one bad element doesn't
+        # crash the whole chunk's extraction.
+        if not isinstance(e, dict):
+            continue
         name = str(e.get("name", "")).strip()
         if not name:
             continue
@@ -70,7 +81,12 @@ def _validate(data: dict) -> Extraction:
                                         summary=str(e.get("summary", "")).strip()))
 
     relations: list[ExtractedRelation] = []
-    for r in data.get("relations", []) or []:
+    raw_relations = data.get("relations", []) or []
+    if not isinstance(raw_relations, list):
+        raw_relations = []
+    for r in raw_relations:
+        if not isinstance(r, dict):
+            continue
         subj = str(r.get("subject", "")).strip()
         obj = str(r.get("object", "")).strip()
         rel = str(r.get("relation", "")).strip().upper()

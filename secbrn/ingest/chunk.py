@@ -36,7 +36,12 @@ def chunk_document(doc: Document, *, chunk_size: int, overlap: int) -> list[Chun
             if kind in ("page", "turn"):
                 span = Span(kind=kind, start=seg_index, end=seg_index, label=seg_label)
             else:
-                span = Span(kind="line", start=lo, end=hi, label=seg_label)
+                # lo/hi are character offsets into seg_text; turn them into real
+                # 1-based document line numbers. seg_index is the line the segment
+                # starts on, and each newline before an offset advances one line.
+                start_line = seg_index + seg_text.count("\n", 0, lo)
+                end_line = seg_index + seg_text.count("\n", 0, hi)
+                span = Span(kind="line", start=start_line, end=end_line, label=seg_label)
             chunks.append(
                 Chunk(
                     id=f"{doc.id}:{pos}",
@@ -96,24 +101,41 @@ def _split_markdown(text: str) -> list[tuple[str | None, int, str]]:
 
 
 def _window(text: str, size: int, overlap: int):
-    """Yield (piece, (start_offset, end_offset)) windows over sentence boundaries."""
-    text = text.strip()
-    if len(text) <= size:
-        yield text, (0, len(text))
+    """Yield (piece, (orig_start, orig_end)) windows over sentence boundaries.
+
+    Pieces are whitespace-normalised, but the returned offsets are character
+    positions into the *original* ``text`` so callers can resolve true line
+    numbers (newlines survive in ``text`` even though they're collapsed in pieces).
+    """
+    stripped = text.strip()
+    if len(stripped) <= size:
+        yield stripped, (0, len(text))
         return
-    sentences = _SENT.split(text)
-    buf = ""
-    start = 0
-    cursor = 0
+    sentences = _SENT.split(stripped)
+    # Locate each sentence's original offset by scanning forward; robust to the
+    # whitespace collapse done by the sentence split.
+    offsets: list[tuple[int, int]] = []
+    scan = 0
     for sent in sentences:
+        i = text.find(sent, scan)
+        if i < 0:
+            i = scan
+        offsets.append((i, i + len(sent)))
+        scan = i + len(sent)
+
+    buf = ""
+    win_lo = offsets[0][0] if offsets else 0
+    win_hi = win_lo
+    for sent, (s_lo, s_hi) in zip(sentences, offsets):
         if buf and len(buf) + len(sent) + 1 > size:
-            yield buf, (start, cursor)
+            yield buf, (win_lo, win_hi)
             # start next window with an overlap tail
             tail = buf[-overlap:] if overlap else ""
-            start = cursor - len(tail)
             buf = (tail + " " + sent).strip()
+            win_lo = max(0, s_lo - len(tail))
+            win_hi = s_hi
         else:
             buf = (buf + " " + sent).strip() if buf else sent
-        cursor += len(sent) + 1
+            win_hi = s_hi
     if buf:
-        yield buf, (start, cursor)
+        yield buf, (win_lo, win_hi)

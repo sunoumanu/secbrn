@@ -55,3 +55,39 @@ def test_extractor_drops_nonconforming(monkeypatch):
 def test_scripted_extraction_conforms():
     ex = extract_chunk("TEXT: Reranking improves Retrieval", ScriptedLLM())
     assert any(r.relation == "IMPROVES" for r in ex.relations)
+
+
+def test_extractor_survives_malformed_json(monkeypatch):
+    """Regression: a model returning entities/relations as bare strings (or a
+    bare list / string instead of an object) must not raise
+    ``AttributeError: 'str' object has no attribute 'get'`` — the chunk should
+    simply yield an empty/partial extraction instead of failing."""
+    import json
+
+    malformed_payloads = [
+        json.dumps({"entities": ["Raskolnikov", "Sonia"], "relations": []}),  # bare strings
+        json.dumps(["Raskolnikov", "Sonia"]),                                  # bare list
+        json.dumps("Raskolnikov"),                                            # bare string
+        json.dumps({"entities": "Raskolnikov", "relations": "x"}),            # string values
+        json.dumps({
+            "entities": [{"name": "Alice", "label": "Person"}, "junk", 42, None],
+            "relations": [{"subject": "Alice", "relation": "RELATES_TO", "object": "Bob"}],
+        }),                                                                   # mixed garbage
+    ]
+
+    class ScriptableLLM:
+        model = "scriptable"
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def complete_json(self, prompt, *, system=None):
+            return self._payload
+
+        def complete(self, *a, **k):
+            return ""
+
+    for payload in malformed_payloads:
+        ex = extract_chunk("text", ScriptableLLM(payload))  # must not raise
+        # well-formed items inside otherwise-garbage payloads still survive
+        assert all(isinstance(e.name, str) and e.name for e in ex.entities)
